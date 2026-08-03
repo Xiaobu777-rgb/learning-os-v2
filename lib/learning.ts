@@ -76,10 +76,11 @@ export async function recordLearningFeedback(input: {
   const supabase = getSupabaseAdminClient();
   if (!supabase) return fail<null>(503, "Supabase 环境变量未配置，请先运行数据库迁移并设置环境变量");
 
-  const entry = await supabase.from("system_dictionary").select("id, term, meaning_zh").eq("id", input.dictionaryId).single();
+  const [entry, existing] = await Promise.all([
+    supabase.from("system_dictionary").select("id, term, meaning_zh").eq("id", input.dictionaryId).single(),
+    supabase.from("user_dictionary_status").select("*").eq("user_id", input.userId).eq("system_dictionary_id", input.dictionaryId).maybeSingle()
+  ]);
   if (entry.error || !entry.data) return fail<null>(404, "找不到训练词条");
-
-  const existing = await supabase.from("user_dictionary_status").select("*").eq("user_id", input.userId).eq("system_dictionary_id", input.dictionaryId).maybeSingle();
   if (existing.error) return fail<null>(500, `读取掌握状态失败：${existing.error.message}`);
   const current = existing.data;
   const timesSeen = (current?.times_seen ?? 0) + 1;
@@ -92,7 +93,7 @@ export async function recordLearningFeedback(input: {
   const daysUntilReview = input.feedback === "known" ? Math.min(14, Math.max(1, knownStreak * 2)) : input.feedback === "uncertain" ? 1 : 0;
   const nextReview = new Date(Date.now() + daysUntilReview * 24 * 60 * 60 * 1000).toISOString();
 
-  const statusResult = await supabase.from("user_dictionary_status").upsert({
+  const statusResultPromise = supabase.from("user_dictionary_status").upsert({
     user_id: input.userId,
     system_dictionary_id: input.dictionaryId,
     status,
@@ -105,45 +106,44 @@ export async function recordLearningFeedback(input: {
     last_studied_at: new Date().toISOString(),
     next_review_at: nextReview
   }, { onConflict: "user_id,system_dictionary_id" });
-  if (statusResult.error) return fail<null>(500, `更新掌握状态失败：${statusResult.error.message}`);
 
-  const record = await supabase.from("learning_records").insert({
+  const recordPromise = supabase.from("learning_records").insert({
     user_id: input.userId,
     system_dictionary_id: input.dictionaryId,
     activity_type: input.activityType,
     result,
     response: input.response?.trim() || null
   });
+  const [statusResult, record] = await Promise.all([statusResultPromise, recordPromise]);
+  if (statusResult.error) return fail<null>(500, `更新掌握状态失败：${statusResult.error.message}`);
   if (record.error) return fail<null>(500, `保存训练记录失败：${record.error.message}`);
 
-  if (input.feedback === "unknown") {
-    const mistake = await supabase.from("mistakes").insert({
+  const mistakePromise = input.feedback === "unknown" ? supabase.from("mistakes").insert({
       user_id: input.userId,
       system_dictionary_id: input.dictionaryId,
       prompt: entry.data.meaning_zh,
       user_answer: input.response?.trim() ?? "",
       correct_answer: entry.data.term,
       mistake_type: input.activityType === "practice" ? "practice" : "learning"
-    });
-    if (mistake.error) return fail<null>(500, `保存错误记录失败：${mistake.error.message}`);
-  }
-
-  if (input.activityType === "review") {
-    const review = await supabase.from("reviews").insert({
+    }) : Promise.resolve({ error: null });
+  const reviewPromise = input.activityType === "review" ? supabase.from("reviews").insert({
       user_id: input.userId,
       system_dictionary_id: input.dictionaryId,
       scheduled_for: new Date().toISOString(),
       reviewed_at: new Date().toISOString(),
       result
-    });
-    if (review.error) return fail<null>(500, `保存 Review 记录失败：${review.error.message}`);
-  }
+    }) : Promise.resolve({ error: null });
+  const [mistake, review] = await Promise.all([mistakePromise, reviewPromise]);
+  if (mistake.error) return fail<null>(500, `保存错误记录失败：${mistake.error.message}`);
+  if (review.error) return fail<null>(500, `保存 Review 记录失败：${review.error.message}`);
 
-  const records = await supabase.from("learning_records").select("result").eq("user_id", input.userId).in("activity_type", ["learn", "practice", "review"]);
-  if (!records.error) {
-    const all = records.data ?? [];
-    const incorrect = all.filter((row) => row.result === "incorrect").length;
-    const answered = all.filter((row) => row.result !== "skipped").length;
+  const [incorrectRecords, answeredRecords] = await Promise.all([
+    supabase.from("learning_records").select("id", { count: "exact", head: true }).eq("user_id", input.userId).eq("result", "incorrect"),
+    supabase.from("learning_records").select("id", { count: "exact", head: true }).eq("user_id", input.userId).neq("result", "skipped")
+  ]);
+  if (!incorrectRecords.error && !answeredRecords.error) {
+    const incorrect = incorrectRecords.count ?? 0;
+    const answered = answeredRecords.count ?? 0;
     await supabase.from("weakness_profiles").upsert({
       user_id: input.userId,
       dimension: "spelling",
