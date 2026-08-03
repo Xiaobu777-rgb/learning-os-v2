@@ -1,0 +1,9 @@
+.next
+node_modules
+dist
+coverage
+*.tsbuildinfo
+.env
+.env*.local
+*.log
+pnpm-debug.log*
