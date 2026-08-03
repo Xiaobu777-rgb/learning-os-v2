@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "app/**/*.ts",
+    "app/**/*.tsx",
+    "components/**/*.ts",
+    "components/**/*.tsx",
+    "lib/**/*.ts",
+    "tailwind.config.ts",
+    "next.config.mjs",
+    "eslint.config.mjs"
+  ],
+  "exclude": ["node_modules", ".next"]
+}
